@@ -1,0 +1,339 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Daily 18:00 UTC. GitHub Actions cron is always UTC.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync upstream into default branch
+    runs-on: ubuntu-latest
+    env:
+      # Optional PAT (repo + workflow scopes). GITHUB_TOKEN cannot push commits
+      # that edit .github/workflows/ because it has no workflows permission.
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      SYNC_LABEL: upstream-sync
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          export GIT_MERGE_AUTOEDIT=no
+          export GIT_TERMINAL_PROMPT=0
+
+          reason_file="${RUNNER_TEMP}/upstream-sync-reason.txt"
+          conflicts_file="${RUNNER_TEMP}/upstream-sync-conflicts.txt"
+          upstream_file="${RUNNER_TEMP}/upstream-sync-upstream.txt"
+          cmd_log="${RUNNER_TEMP}/upstream-sync-cmd.log"
+          echo "同步步骤异常退出（详见运行日志）。未推送。" > "$reason_file"
+          : > "$conflicts_file"
+          printf '%s\n%s\n' "FunnyEntity/Osu_Ranked_Downloader" "main" > "$upstream_file"
+
+          fail() {
+            printf '%s\n' "$1" > "$reason_file"
+            exit 1
+          }
+
+          # Record the active phase, run a command, and on failure keep its output
+          # in the reason file so the issue says what actually failed. Clear the
+          # failure text after success so a later step does not report this one.
+          run_logged() {
+            local message="$1"
+            shift
+            printf '%s\n' "$message" > "$reason_file"
+            if ! "$@" >"$cmd_log" 2>&1; then
+              {
+                printf '%s\n' "$message"
+                echo "命令输出："
+                cat "$cmd_log"
+              } > "$reason_file"
+              return 1
+            fi
+            printf '%s\n' "同步步骤异常退出（详见运行日志）。未推送。" > "$reason_file"
+          }
+
+          if [ -z "${DEFAULT_BRANCH}" ]; then
+            fail "无法确定 fork 的默认分支，未推送。"
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          echo "解析 GitHub parent 上游失败，未推送。" > "$reason_file"
+          repo_json="$(gh api "repos/${GITHUB_REPOSITORY}")"
+          parent="$(jq -r '.parent.full_name // empty' <<<"$repo_json")"
+          branch="$(jq -r '.parent.default_branch // empty' <<<"$repo_json")"
+          if [ -z "$parent" ] || [ -z "$branch" ]; then
+            fail "该仓库不是 fork，或 API 没有返回 parent/默认分支，未推送。"
+          fi
+          if [[ ! "$parent" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            fail "上游仓库名异常（${parent}），已中止，未推送。"
+          fi
+          if [[ ! "$branch" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            fail "上游分支名异常（${branch}），已中止，未推送。"
+          fi
+          printf '%s\n%s\n' "$parent" "$branch" > "$upstream_file"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/${parent}.git"
+          else
+            git remote add upstream "https://github.com/${parent}.git"
+          fi
+          run_logged "fetch 上游 ${parent} ${branch} 失败，未推送。" \
+            git fetch --no-tags upstream "refs/heads/${branch}:refs/remotes/upstream/${branch}"
+
+          if git merge-base --is-ancestor "refs/remotes/upstream/${branch}" HEAD; then
+            echo "已包含上游 ${parent} ${branch}，无需同步。"
+            exit 0
+          fi
+
+          before="$(git rev-parse HEAD)"
+          merge_log="${RUNNER_TEMP}/upstream-sync-merge.log"
+          if ! git merge --no-edit "refs/remotes/upstream/${branch}" >"$merge_log" 2>&1; then
+            git diff --name-only --diff-filter=U > "$conflicts_file" || true
+            {
+              if [ -s "$conflicts_file" ]; then
+                echo "合并上游 ${parent} ${branch} 发生冲突，已中止合并，未推送。"
+                echo "冲突文件："
+                cat "$conflicts_file"
+              else
+                echo "合并上游 ${parent} ${branch} 失败（非干净合并），已中止，未推送。"
+              fi
+              echo "命令输出："
+              cat "$merge_log"
+            } > "$reason_file"
+            git merge --abort || true
+            exit 1
+          fi
+
+          after="$(git rev-parse HEAD)"
+          if [ "$before" = "$after" ]; then
+            echo "合并后无新提交，跳过推送。"
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "$before" "$after" || true)"
+          push_log="${RUNNER_TEMP}/upstream-sync-push.log"
+          if ! git push origin "HEAD:${DEFAULT_BRANCH}" >"$push_log" 2>&1; then
+            {
+              echo "推送到 ${DEFAULT_BRANCH} 失败，默认分支未更新。"
+              if printf '%s\n' "$changed" | grep -Eq '(^|/)\.github/workflows/'; then
+                echo "本次合并修改了 .github/workflows/ 下的文件。GITHUB_TOKEN 没有 workflows 权限，GitHub 会拒绝推送 workflow 文件。"
+                echo "修复：在仓库 Settings → Secrets and variables → Actions 添加 secret UPSTREAM_SYNC_TOKEN（PAT，包含 repo 与 workflow 权限）后重新运行本工作流。"
+                echo "涉及的 workflow 文件："
+                printf '%s\n' "$changed" | grep -E '(^|/)\.github/workflows/' || true
+              fi
+              echo "命令输出："
+              cat "$push_log"
+            } > "$reason_file"
+            exit 1
+          fi
+          echo "已将上游 ${parent} ${branch} 合并并推送到 ${DEFAULT_BRANCH}。"
+
+      - name: Report failure
+        if: failure()
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          reason_file="${RUNNER_TEMP}/upstream-sync-reason.txt"
+          conflicts_file="${RUNNER_TEMP}/upstream-sync-conflicts.txt"
+          upstream_file="${RUNNER_TEMP}/upstream-sync-upstream.txt"
+          err_file="${RUNNER_TEMP}/upstream-sync-issue-error.txt"
+          body_file="${RUNNER_TEMP}/upstream-sync-issue-body.md"
+          comment_file="${RUNNER_TEMP}/upstream-sync-issue-comment.md"
+          : > "$err_file"
+
+          reason="同步失败（未能读取失败详情，请查看运行日志）。"
+          if [ -s "${reason_file}" ]; then
+            reason="$(cat "$reason_file")"
+          fi
+          conflicts="（无，或失败发生在冲突检测之前）"
+          if [ -s "${conflicts_file}" ]; then
+            conflicts="$(cat "$conflicts_file")"
+          fi
+          parent="FunnyEntity/Osu_Ranked_Downloader"
+          branch="main"
+          if [ -s "${upstream_file}" ]; then
+            parent="$(sed -n '1p' "$upstream_file")"
+            branch="$(sed -n '2p' "$upstream_file")"
+          fi
+          [ -n "$parent" ] || parent="FunnyEntity/Osu_Ranked_Downloader"
+          [ -n "$branch" ] || branch="main"
+          default_branch="${DEFAULT_BRANCH:-main}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          title="上游同步失败 $(date -u +%F)"
+          label="${SYNC_LABEL:-upstream-sync}"
+
+          export BODY_FILE="$body_file"
+          export COMMENT_FILE="$comment_file"
+          export REASON="$reason"
+          export CONFLICTS="$conflicts"
+          export PARENT="$parent"
+          export BRANCH="$branch"
+          export DEFAULT_BRANCH_NAME="$default_branch"
+          export RUN_URL="$run_url"
+          export SYNC_LABEL_NAME="$label"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          reason = os.environ["REASON"]
+          conflicts = os.environ["CONFLICTS"]
+          parent = os.environ["PARENT"]
+          branch = os.environ["BRANCH"]
+          default_branch = os.environ["DEFAULT_BRANCH_NAME"]
+          run_url = os.environ["RUN_URL"]
+          label = os.environ["SYNC_LABEL_NAME"]
+
+          body = f"""每日上游同步失败，fork 的默认分支没有被更新。
+
+          ### 失败原因
+          {reason}
+
+          ### 运行记录
+          {run_url}
+
+          ### 上游
+          - 仓库：`{parent}`
+          - 分支：`{branch}`
+
+          ### 冲突文件
+          ```
+          {conflicts}
+          ```
+
+          ### 本地修复
+          ```bash
+          git fetch https://github.com/{parent}.git {branch}
+          git checkout {default_branch}
+          git merge FETCH_HEAD
+          # 解决冲突后
+          git push origin {default_branch}
+          ```
+
+          ### 若推送因 workflow 文件被拒绝
+          `GITHUB_TOKEN` 无法推送修改 `.github/workflows/` 的提交（缺少 `workflows` 权限）。上游若改动了 workflow 文件，推送会被 GitHub 拒绝。
+
+          修复：在仓库 Settings → Secrets and variables → Actions 添加 secret `UPSTREAM_SYNC_TOKEN`（PAT，包含 **repo** 与 **workflow** 权限）。本工作流会优先用它推送，并用它创建或评论 issue。
+          """
+          comment = f"""上游同步再次失败，已有未关闭的 `{label}` issue，此处只补充记录。
+
+          - 运行记录：{run_url}
+          - 上游：`{parent}` `{branch}`
+          - 失败原因：
+          {reason}
+
+          - 冲突文件：
+          ```
+          {conflicts}
+          ```
+          """
+          Path(os.environ["BODY_FILE"]).write_text(body)
+          Path(os.environ["COMMENT_FILE"]).write_text(comment)
+          PY
+
+          issues_hint=""
+          has_issues="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.has_issues' 2>>"$err_file" || echo unknown)"
+          if [ "$has_issues" = "false" ]; then
+            issues_hint="仓库未开启 Issues（has_issues=false）。请到 Settings → General → Features 打开 Issues。"
+          fi
+
+          # Create the label before using it. A failure here must not stop the
+          # unlabeled issue fallback below.
+          gh label create "$label" \
+            --color B60205 \
+            --description "上游自动同步失败" \
+            --force || true
+
+          existing=""
+          list_ok=false
+
+          if existing="$(gh issue list --state open --label "$label" --limit 1 --json number --jq '.[0].number // empty' 2>>"$err_file")"; then
+            list_ok=true
+          else
+            echo "--- gh issue list by label failed; trying REST ---" >> "$err_file"
+            if existing="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/issues" -f state=open -f labels="$label" -f per_page=20 --jq '[.[] | select(.pull_request | not)][0].number // empty' 2>>"$err_file")"; then
+              list_ok=true
+            fi
+          fi
+
+          # Unlabeled fallback issues (label API failed last time) still count,
+          # so a later run comments instead of opening another copy.
+          if [ "$list_ok" = true ] && [ -z "$existing" ]; then
+            if title_hit="$(gh issue list --state open --limit 50 --json number,title --jq '[.[] | select(.title | startswith("上游同步失败"))][0].number // empty' 2>>"$err_file")"; then
+              existing="$title_hit"
+            else
+              echo "--- gh issue list by title failed; trying REST ---" >> "$err_file"
+              if title_hit="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/issues" -f state=open -f per_page=50 --jq '[.[] | select(.pull_request | not) | select(.title | startswith("上游同步失败"))][0].number // empty' 2>>"$err_file")"; then
+                existing="$title_hit"
+              else
+                list_ok=false
+              fi
+            fi
+          fi
+
+          reported=false
+          if [ "$list_ok" = true ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            if gh issue comment "$existing" --body-file "$comment_file" 2>>"$err_file"; then
+              reported=true
+            else
+              echo "--- gh issue comment failed; trying REST ---" >> "$err_file"
+              if jq -n --rawfile body "$comment_file" '{body:$body}' \
+                | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" --input - >/dev/null 2>>"$err_file"; then
+                reported=true
+              fi
+            fi
+          else
+            if gh issue create --title "$title" --body-file "$body_file" --label "$label" >/dev/null 2>>"$err_file"; then
+              reported=true
+            else
+              echo "--- labeled issue create failed; retrying without label ---" >> "$err_file"
+              if gh issue create --title "$title" --body-file "$body_file" >/dev/null 2>>"$err_file"; then
+                reported=true
+              else
+                echo "--- gh issue create failed; trying REST ---" >> "$err_file"
+                if jq -n --arg title "$title" --rawfile body "$body_file" --arg label "$label" \
+                  '{title:$title, body:$body, labels:[$label]}' \
+                  | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues" --input - >/dev/null 2>>"$err_file"; then
+                  reported=true
+                elif jq -n --arg title "$title" --rawfile body "$body_file" \
+                  '{title:$title, body:$body}' \
+                  | gh api --method POST "repos/${GITHUB_REPOSITORY}/issues" --input - >/dev/null 2>>"$err_file"; then
+                  reported=true
+                fi
+              fi
+            fi
+          fi
+
+          if [ "$reported" = true ]; then
+            exit 0
+          fi
+
+          echo "::error::无法创建或评论上游同步 issue，同步失败仍未上报。"
+          if [ -n "$issues_hint" ]; then
+            echo "::error::${issues_hint}"
+          fi
+          echo "::error::若 Issues 已开启仍失败，请将 Actions 工作流权限设为 Read and write，或配置 secret UPSTREAM_SYNC_TOKEN（PAT，repo + workflow）。常见错误：GraphQL Resource not accessible by integration (createIssue)。"
+          echo "---- issue API errors ----"
+          cat "$err_file" || true
+          exit 1
